@@ -3,11 +3,11 @@
 Franka Cube Stacking Customer Flow — expert motion and failure samples.
 
 Choreographed Scenario:
-- Stage 1 (0s to 30s): Expert stack/unstack motion.
-- Stage 2 (30s to 80s): Unstable stacking with wrong placement, then collapse.
-- Stage 3 (80s to 110s): Repeated cube drops from different heights.
-- Stage 4 (110s to 140s): Abnormal arm behavior: turn away, scrape table, random gripper.
-- At 140s, the entire scenario resets back to Stage 1.
+- Stage 1 (0s to 25s): Expert stack/unstack motion.
+- Stage 2 (25s to 60s): Unstable stacking with wrong placement, then collapse.
+- Stage 3 (60s to 80s): Repeated cube drops from different heights.
+- Stage 4 (80s to 100s): Abnormal arm behavior: turn away, scrape table, random gripper.
+- At 100s, the entire scenario resets back to Stage 1.
 
 Usage:
     conda activate env_isaaclab
@@ -24,14 +24,26 @@ parser = argparse.ArgumentParser(description="Multi-env Franka choreographed dem
 parser.add_argument("--num_envs", type=int, default=4)
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 parser.add_argument("--debug_env_logs", action="store_true", default=False)
+parser.add_argument("--video", action="store_true", default=False, help="Record an mp4 video.")
+parser.add_argument("--video_length", type=int, default=3000, help="Length of the recorded video in env steps.")
+parser.add_argument("--video_folder", type=str, default="videos/stack_cube_customer_flow", help="Directory for mp4 output.")
+parser.add_argument("--video_fps", type=int, default=60, help="Final FPS for the mp4; capture FPS preserves sim speed.")
+parser.add_argument("--video_width", type=int, default=1998, help="Recorded video frame width in pixels.")
+parser.add_argument("--video_height", type=int, default=1080, help="Recorded video frame height in pixels.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.video:
+    args_cli.enable_cameras = True
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 """Rest everything else."""
 
 import math
+import os
+import glob
+import shutil
+import subprocess
 import gymnasium as gym
 import torch
 import isaaclab.sim as sim_utils
@@ -78,15 +90,21 @@ SCENARIO_STAGE_NAMES = {
     4: "Stage 4 ABNORMAL ARM | turn away + table scrape",
 }
 
+STAGE_1_END = 25.0
+STAGE_2_END = 60.0
+STAGE_3_END = 80.0
+SCENARIO_END = 100.0
+STAGE_4_START = STAGE_3_END
+
 FLIP_QUAT = torch.tensor([0.0, 1.0, 0.0, 0.0])
 
 
 def scenario_stage(global_time: float) -> tuple[int, str]:
-    if global_time < 30.0:
+    if global_time < STAGE_1_END:
         stage = 1
-    elif global_time < 80.0:
+    elif global_time < STAGE_2_END:
         stage = 2
-    elif global_time < 110.0:
+    elif global_time < STAGE_3_END:
         stage = 3
     else:
         stage = 4
@@ -98,6 +116,67 @@ def format_env_ids(env_ids, max_count: int = 12) -> str:
     shown = values[:max_count]
     suffix = "" if len(values) <= max_count else f"...(+{len(values) - max_count})"
     return f"{len(values)} envs {shown}{suffix}"
+
+
+def natural_video_fps(env_cfg) -> int:
+    """FPS that keeps one recorded frame per env step at real simulation speed."""
+    return max(1, int(round(1.0 / (env_cfg.sim.dt * env_cfg.decimation))))
+
+
+def ffmpeg_executable() -> str | None:
+    exe = shutil.which("ffmpeg")
+    if exe is not None:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def convert_latest_video_fps(video_folder: str, target_fps: int, capture_fps: int):
+    """Convert the newest mp4 to target_fps without changing playback duration."""
+    if target_fps <= 0 or target_fps == capture_fps:
+        return
+
+    ffmpeg = ffmpeg_executable()
+    if ffmpeg is None:
+        print(
+            f"[WARN] ffmpeg not found. Kept video at {capture_fps} fps so playback speed remains correct.",
+            flush=True,
+        )
+        return
+
+    candidates = [
+        path for path in glob.glob(os.path.join(video_folder, "*.mp4"))
+        if ".tmp-" not in os.path.basename(path)
+    ]
+    if not candidates:
+        print(f"[WARN] No mp4 found in {os.path.abspath(video_folder)} for fps conversion.", flush=True)
+        return
+
+    src = max(candidates, key=os.path.getmtime)
+    tmp = f"{src[:-4]}.tmp-{target_fps}fps.mp4"
+    cmd = [
+        ffmpeg, "-y", "-i", src,
+        "-vf", f"fps={target_fps}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        tmp,
+    ]
+    print(f"[INFO] Converting {os.path.basename(src)} to {target_fps} fps without speeding it up.", flush=True)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        print(
+            f"[WARN] Could not convert video to {target_fps} fps. Kept {capture_fps} fps output.\n"
+            f"{result.stderr[-1200:]}",
+            flush=True,
+        )
+        return
+    os.replace(tmp, src)
+    print(f"[INFO] Final video: {src} ({target_fps} fps, duration preserved).", flush=True)
 
 
 def yaw_from_quat(q: torch.Tensor) -> torch.Tensor:
@@ -435,7 +514,7 @@ class StackSM:
         if current_stage == 4:
             t_wave = self.global_time
             for i in range(self.N):
-                mode = (i + int((t_wave - 110.0) / 4.0)) % 3
+                mode = (i + int((t_wave - STAGE_4_START) / 4.0)) % 3
                 if mode == 0:
                     # Turn away from the table.
                     side = -1.0 if i % 2 == 0 else 1.0
@@ -484,8 +563,8 @@ class StackSM:
 
         if current_stage == 2:
             # Unstable stack: visible motion error plus wrong placement offsets above.
-            pos_noise = torch.randn_like(delta_pos) * 0.08
-            rot_noise = torch.randn_like(delta_rot) * 0.18
+            pos_noise = torch.randn_like(delta_pos) * 0.05
+            rot_noise = torch.randn_like(delta_rot) * 0.10
             delta_pos += pos_noise
             delta_rot += rot_noise
         elif current_stage == 3:
@@ -517,7 +596,7 @@ class StackSM:
         rot_err_norm = torch.norm(axis_angle_err, dim=-1)
 
         # Keep the stack/unstack state machine running throughout the customer flow.
-        if self.global_time < 140.0:
+        if self.global_time < SCENARIO_END:
             self.timer += self.dt
 
             LOOSE_POS_ONLY = {S.LIFT, S.RETREAT}
@@ -634,8 +713,11 @@ def main():
         use_fabric=not args_cli.disable_fabric,
     )
 
-    # Keep the built-in timeout beyond the 140s customer flow; we reset manually.
-    env_cfg.episode_length_s = 160.0
+    # Keep the built-in timeout beyond the 100s customer flow; we reset manually.
+    env_cfg.episode_length_s = SCENARIO_END + 20.0
+    if args_cli.video:
+        env_cfg.viewer.resolution = (args_cli.video_width, args_cli.video_height)
+    video_capture_fps = natural_video_fps(env_cfg)
 
     # Colors in LINEAR color space (converted from sRGB).
     # sRGB → linear: ((x + 0.055) / 1.055) ^ 2.4  (for x > 0.04045)
@@ -659,7 +741,30 @@ def main():
                 setattr(env_cfg.terminations, term_name, None)
 
     print(f"[INFO] Task: {task} | num_envs: {args_cli.num_envs}", flush=True)
-    env = gym.make(task, cfg=env_cfg)
+    if args_cli.video:
+        env = gym.make(task, cfg=env_cfg, render_mode="rgb_array")
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder=args_cli.video_folder,
+            step_trigger=lambda step: step == 0,
+            video_length=args_cli.video_length,
+            fps=video_capture_fps,
+            disable_logger=True,
+        )
+        video_dir = os.path.abspath(args_cli.video_folder)
+        print(
+            f"[INFO] Recording video to: {video_dir} "
+            f"({args_cli.video_width}x{args_cli.video_height}, "
+            f"capture {video_capture_fps} fps -> final {args_cli.video_fps} fps)",
+            flush=True,
+        )
+        print(
+            f"[INFO] Video will finalize after {args_cli.video_length} env steps "
+            f"(~{args_cli.video_length / video_capture_fps:.1f}s playback).",
+            flush=True,
+        )
+    else:
+        env = gym.make(task, cfg=env_cfg)
     print(f"[INFO] Action space: {env.action_space.shape}", flush=True)
     obs, info = env.reset()
     print(f"[INFO] Running! Choreographed demo starting.", flush=True)
@@ -678,12 +783,12 @@ def main():
     while simulation_app.is_running():
         with torch.inference_mode():
             # Check scenario reset
-            if sm.global_time >= 140.0:
+            if sm.global_time >= SCENARIO_END:
                 sm.global_time = 0.0
                 env.unwrapped._reset_idx(torch.arange(sm.N, device=sm.dev))
                 sm.reset_idx(torch.arange(sm.N, device=sm.dev))
                 last_stage_num = 0
-                print(f"[{step:5d}] Customer flow complete at 140s. Resetting to Stage 1.", flush=True)
+                print(f"[{step:5d}] Customer flow complete at 100s. Resetting to Stage 1.", flush=True)
 
             ee_frame = env.unwrapped.scene["ee_frame"]
             ee_pos = ee_frame.data.target_pos_w[..., 0, :].clone() - env.unwrapped.scene.env_origins
@@ -742,7 +847,17 @@ def main():
                     flush=True,
                 )
 
+            if args_cli.video and step >= args_cli.video_length:
+                print(
+                    f"[{step:5d}] Video length reached. Closing env to finalize mp4 in "
+                    f"{os.path.abspath(args_cli.video_folder)}",
+                    flush=True,
+                )
+                break
+
     env.close()
+    if args_cli.video:
+        convert_latest_video_fps(args_cli.video_folder, args_cli.video_fps, video_capture_fps)
 
 
 if __name__ == "__main__":

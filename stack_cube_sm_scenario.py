@@ -13,6 +13,7 @@ Usage:
     conda activate env_isaaclab
     cd /home/truongnq/Desktop/3cube
     python stack_cube_sm_scenario.py --num_envs 4
+    python stack_cube_sm_scenario.py --num_envs 4 --no-video  # run without recording
 """
 
 """Launch Omniverse first."""
@@ -24,9 +25,12 @@ parser = argparse.ArgumentParser(description="Multi-env Franka choreographed dem
 parser.add_argument("--num_envs", type=int, default=4)
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 parser.add_argument("--debug_env_logs", action="store_true", default=False)
-parser.add_argument("--video", action="store_true", default=False, help="Record an mp4 video.")
+parser.add_argument("--video", action=argparse.BooleanOptionalAction, default=True, help="Record an mp4 video.")
 parser.add_argument("--video_length", type=int, default=3000, help="Length of the recorded video in env steps.")
 parser.add_argument("--video_folder", type=str, default="videos/stack_cube_scenario", help="Directory for mp4 output.")
+parser.add_argument("--video_fps", type=int, default=60, help="Final FPS for the mp4; capture FPS preserves sim speed.")
+parser.add_argument("--video_width", type=int, default=1998, help="Recorded video frame width in pixels.")
+parser.add_argument("--video_height", type=int, default=1080, help="Recorded video frame height in pixels.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.video:
@@ -38,6 +42,9 @@ simulation_app = app_launcher.app
 
 import math
 import os
+import glob
+import shutil
+import subprocess
 import gymnasium as gym
 import torch
 import isaaclab.sim as sim_utils
@@ -80,7 +87,7 @@ CARRYING_STATES = {S.GRASP, S.LIFT, S.ABOVE_PLACE, S.DOWN_PLACE}
 SCENARIO_STAGE_NAMES = {
     1: "Stage 1 NORMAL | stack/unstack, no jitter, no freeze",
     2: "Stage 2 STRONG JITTER | stack/unstack with vibration",
-    3: "Stage 3 LIGHT JITTER + FREEZE | random 1s joint hold while gripping",
+    3: "Stage 3 LIGHT JITTER + RANDOM DROP | gripper opens randomly while carrying",
     4: "Stage 4 CHAOS | strong jitter + wave arms + random gripper",
 }
 
@@ -88,11 +95,11 @@ FLIP_QUAT = torch.tensor([0.0, 1.0, 0.0, 0.0])
 
 
 def scenario_stage(global_time: float) -> tuple[int, str]:
-    if global_time < 20.0:
+    if global_time < 30.0:
         stage = 1
-    elif global_time < 40.0:
-        stage = 2
     elif global_time < 60.0:
+        stage = 2
+    elif global_time < 90.0:
         stage = 3
     else:
         stage = 4
@@ -104,6 +111,67 @@ def format_env_ids(env_ids, max_count: int = 12) -> str:
     shown = values[:max_count]
     suffix = "" if len(values) <= max_count else f"...(+{len(values) - max_count})"
     return f"{len(values)} envs {shown}{suffix}"
+
+
+def natural_video_fps(env_cfg) -> int:
+    """FPS that keeps one recorded frame per env step at real simulation speed."""
+    return max(1, int(round(1.0 / (env_cfg.sim.dt * env_cfg.decimation))))
+
+
+def ffmpeg_executable() -> str | None:
+    exe = shutil.which("ffmpeg")
+    if exe is not None:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def convert_latest_video_fps(video_folder: str, target_fps: int, capture_fps: int):
+    """Convert the newest mp4 to target_fps without changing playback duration."""
+    if target_fps <= 0 or target_fps == capture_fps:
+        return
+
+    ffmpeg = ffmpeg_executable()
+    if ffmpeg is None:
+        print(
+            f"[WARN] ffmpeg not found. Kept video at {capture_fps} fps so playback speed remains correct.",
+            flush=True,
+        )
+        return
+
+    candidates = [
+        path for path in glob.glob(os.path.join(video_folder, "*.mp4"))
+        if ".tmp-" not in os.path.basename(path)
+    ]
+    if not candidates:
+        print(f"[WARN] No mp4 found in {os.path.abspath(video_folder)} for fps conversion.", flush=True)
+        return
+
+    src = max(candidates, key=os.path.getmtime)
+    tmp = f"{src[:-4]}.tmp-{target_fps}fps.mp4"
+    cmd = [
+        ffmpeg, "-y", "-i", src,
+        "-vf", f"fps={target_fps}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        tmp,
+    ]
+    print(f"[INFO] Converting {os.path.basename(src)} to {target_fps} fps without speeding it up.", flush=True)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        print(
+            f"[WARN] Could not convert video to {target_fps} fps. Kept {capture_fps} fps output.\n"
+            f"{result.stderr[-1200:]}",
+            flush=True,
+        )
+        return
+    os.replace(tmp, src)
+    print(f"[INFO] Final video: {src} ({target_fps} fps, duration preserved).", flush=True)
 
 
 def yaw_from_quat(q: torch.Tensor) -> torch.Tensor:
@@ -199,6 +267,7 @@ class StackSM:
         self.state = torch.zeros(num_envs, dtype=torch.long, device=device)
         self.timer = torch.zeros(num_envs, device=device)
         self.phase = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.phase_timer = torch.zeros(num_envs, device=device)
         self.saved_pick_pos = torch.zeros(num_envs, 3, device=device)
         self.saved_pick_quat = (
             FLIP_QUAT.to(device).unsqueeze(0).expand(num_envs, -1).clone()
@@ -213,13 +282,10 @@ class StackSM:
         self.c3_init_q[:, 0] = 1.0
         self.init_saved = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
-        # Stage 3 occasional freeze timer per env
-        self.freeze_timer = torch.zeros(num_envs, device=device)
-        self.freeze_duration = 1.0
-        self.freeze_trigger_prob = 0.018
-        self.freeze_lift_duration = 0.25
-        self.freeze_lift_z = 0.035
-        self.freeze_gripper_action = 1.0
+        # Stage 3 random gripper drop timer per env
+        self.drop_timer = torch.zeros(num_envs, device=device)
+        self.drop_duration = 0.5       # gripper stays open for 0.5s
+        self.drop_trigger_prob = 0.015  # ~1.5% per step → average ~3.3s of carrying before trigger
 
         # Grasp offsets at grasp time:
         self.grasp_offset_yaw = torch.zeros(num_envs, device=device)
@@ -247,6 +313,7 @@ class StackSM:
         self.state[ids] = S.REST
         self.timer[ids] = 0.0
         self.phase[ids] = 0
+        self.phase_timer[ids] = 0.0
         self.saved_pick_pos[ids] = 0.0
         self.saved_pick_quat[ids] = FLIP_QUAT.to(self.dev)
         self.prev_action[ids] = 0.0
@@ -254,14 +321,15 @@ class StackSM:
         self.init_saved[ids] = False
         self.grasp_offset_yaw[ids] = 0.0
         self.grasp_offset_pos[ids] = 0.0
-        self.freeze_timer[ids] = 0.0
+        self.drop_timer[ids] = 0.0
 
     def compute(self, ee_pos, ee_quat, c1, c2, c3, c1_q, c2_q, c3_q):
-        # Update global timer
+        # Update global and phase timers
         self.global_time += self.dt
+        self.phase_timer += self.dt
 
-        # Decay freeze timer
-        self.freeze_timer = torch.clamp(self.freeze_timer - self.dt, min=0.0)
+        # Decay drop timer
+        self.drop_timer = torch.clamp(self.drop_timer - self.dt, min=0.0)
 
         # Save initial positions once per episode when env resets
         for i in range(self.N):
@@ -272,26 +340,21 @@ class StackSM:
                 self.c3_init_q[i] = c3_q[i].clone()
                 self.init_saved[i] = True
 
-        # In Stage 3 (40.0 <= global_time < 60.0), occasionally freeze while gripping a cube.
-        if 40.0 <= self.global_time < 60.0:
+        # In Stage 3 (60.0 <= global_time < 90.0), randomly open gripper while carrying.
+        if 60.0 <= self.global_time < 90.0:
             for i in range(self.N):
-                if self.freeze_timer[i] == 0.0:
+                if self.drop_timer[i] == 0.0:
                     s = self.state[i].item()
-                    # Trigger only when the gripper is closed on a cube.
                     if s in CARRYING_STATES:
-                        # ~1.8% chance per step (50ms) -> average trigger time is 2.8 seconds of carrying
-                        if torch.rand(1, device=self.dev).item() < self.freeze_trigger_prob:
-                            self.freeze_timer[i] = self.freeze_duration
+                        if torch.rand(1, device=self.dev).item() < self.drop_trigger_prob:
+                            self.drop_timer[i] = self.drop_duration
                             print(
-                                f"[Stage 3 LIGHT JITTER + FREEZE] env={i} state={STATE_NAMES[s]} "
-                                f"phase={self.phase[i].item()} hold={self.freeze_duration:.1f}s; "
-                                f"lift z +{self.freeze_lift_z:.3f}m, then freeze and release gripper.",
+                                f"[Stage 3 RANDOM DROP] env={i} state={STATE_NAMES[s]} "
+                                f"phase={self.phase[i].item()} | gripper opening for {self.drop_duration:.1f}s",
                                 flush=True,
                             )
 
-        freeze_mask = self.freeze_timer > 0.0
-        freeze_lift_mask = freeze_mask & (self.freeze_timer > self.freeze_duration - self.freeze_lift_duration)
-        freeze_release_mask = freeze_mask & ~freeze_lift_mask
+        drop_mask = self.drop_timer > 0.0
 
         # Vectorized target calculation based on phase
         is_ph0 = (self.phase == 0).unsqueeze(-1)
@@ -405,19 +468,13 @@ class StackSM:
             elif s == S.DONE:
                 target[i] = ee_pos[i]
 
-        # ── Stage 3 Freeze / Stage 4 Wave Overrides ────────────────────────────────
+        # ── Stage 3 Gripper Drop / Stage 4 Wave Overrides ──────────────────────────
 
-        for i in range(self.N):
-            if freeze_mask[i]:
-                # Stage 3: first lift slightly, then hold the current pose and loosen the gripper.
-                target[i] = ee_pos[i].clone()
-                if freeze_lift_mask[i]:
-                    target[i, 2] += self.freeze_lift_z
-                    gripper[i] = -1.0
-                else:
-                    gripper[i] = self.freeze_gripper_action
+        # Stage 3: force gripper open on envs with active drop timer
+        if drop_mask.any():
+            gripper[drop_mask] = 1.0  # open gripper
 
-        if 60.0 <= self.global_time < 80.0:
+        if 90.0 <= self.global_time < 120.0:
             # Stage 4: Chaotic failure
             t_wave = self.global_time
             for i in range(self.N):
@@ -456,43 +513,32 @@ class StackSM:
 
         # ── Action Jitter Overrides ───────────────────────────────────────────────
 
-        if 20.0 <= self.global_time < 40.0:
-            # Stage 2: Strong jitter, ramped in across the 20s stage.
-            scale = (self.global_time - 20.0) / 20.0
-            pos_noise = torch.randn_like(delta_pos) * 0.15 * scale
-            rot_noise = torch.randn_like(delta_rot) * 0.35 * scale
+        if 30.0 <= self.global_time < 60.0:
+            # Stage 2: Fixed moderate jitter.
+            pos_noise = torch.randn_like(delta_pos) * 0.08
+            rot_noise = torch.randn_like(delta_rot) * 0.08
             delta_pos += pos_noise
             delta_rot += rot_noise
-        elif 40.0 <= self.global_time < 60.0:
+        elif 60.0 <= self.global_time < 90.0:
             # Stage 3: Light jitter only; random joint freeze handles the dramatic failure.
             pos_noise = torch.randn_like(delta_pos) * 0.05
-            rot_noise = torch.randn_like(delta_rot) * 0.12
+            rot_noise = torch.randn_like(delta_rot) * 0.05
             delta_pos += pos_noise
             delta_rot += rot_noise
-        elif 60.0 <= self.global_time < 80.0:
+        elif 90.0 <= self.global_time < 120.0:
             # Stage 4: High chaotic jitter
-            pos_noise = torch.randn_like(delta_pos) * 0.20
+            pos_noise = torch.randn_like(delta_pos) * 0.30
             rot_noise = torch.randn_like(delta_rot) * 0.45
             delta_pos += pos_noise
             delta_rot += rot_noise
 
-        if freeze_mask.any():
-            # Remove jitter and EMA carry-over from frozen envs.
-            # The first slice lifts Z a bit; the rest sends zero pose action to hold joint posture.
-            delta_pos[freeze_mask] = 0.0
-            delta_rot[freeze_mask] = 0.0
-            if freeze_lift_mask.any():
-                delta_pos[freeze_lift_mask, 2] = self.kp * self.freeze_lift_z
-                gripper[freeze_lift_mask] = -1.0
-            if freeze_release_mask.any():
-                gripper[freeze_release_mask] = self.freeze_gripper_action
 
         # === State transitions ===
         dist = torch.norm(target - ee_pos, dim=-1)
         rot_err_norm = torch.norm(axis_angle_err, dim=-1)
 
         # Advance the stack/unstack state machine during every 20s stage.
-        if self.global_time < 80.0:
+        if self.global_time < 120.0:
             self.timer += self.dt
 
             LOOSE_POS_ONLY = {S.LIFT, S.RETREAT}
@@ -500,9 +546,6 @@ class StackSM:
             TIGHT_BOTH = {S.DOWN_PICK, S.DOWN_PLACE}
 
             for i in range(self.N):
-                # Do not transition if frozen
-                if freeze_mask[i]:
-                    continue
 
                 s = self.state[i].item()
                 d = dist[i].item()
@@ -568,11 +611,13 @@ class StackSM:
                         ph = self.phase[i].item()
                         if ph < 3:
                             self.phase[i] = ph + 1
+                            self.phase_timer[i] = 0.0
                             self.state[i] = S.REST
                             if self.debug_env_logs:
                                 print(f"[Env {i}] Transitioning to Phase {ph+1}", flush=True)
                         else:
                             self.phase[i] = 4
+                            self.phase_timer[i] = 0.0
                             self.state[i] = S.DONE
                             if self.debug_env_logs:
                                 print(f"[Env {i}] Stacking & Unstacking complete! State: DONE.", flush=True)
@@ -588,15 +633,42 @@ class StackSM:
 
         a = self.action_alpha
         actions[:, :6] = a * actions[:, :6] + (1.0 - a) * self.prev_action[:, :6]
-        if freeze_mask.any():
-            actions[freeze_mask, :6] = 0.0
-            if freeze_lift_mask.any():
-                actions[freeze_lift_mask, 2] = self.kp * self.freeze_lift_z
         self.prev_action = actions.clone()
         return actions
 
     def force_reset_mask(self) -> torch.Tensor:
         return (self.state == S.DONE) & (self.timer >= WAIT[S.DONE])
+
+    def check_cube_lost(self, ee_pos, c2_pos, c3_pos) -> torch.Tensor:
+        # Determine which cube is being carried based on phase
+        is_ph0 = (self.phase == 0).unsqueeze(-1)
+        is_ph1 = (self.phase == 1).unsqueeze(-1)
+        is_ph2 = (self.phase == 2).unsqueeze(-1)
+        is_ph3 = (self.phase == 3).unsqueeze(-1)
+        
+        # Target cube position
+        target_cube_pos = (
+            is_ph0.float() * c2_pos +
+            is_ph1.float() * c3_pos +
+            is_ph2.float() * c3_pos +
+            is_ph3.float() * c2_pos
+        )
+        
+        # Distance between end-effector and target cube
+        dist_ee_cube = torch.norm(ee_pos - target_cube_pos, dim=-1)
+        
+        # Check if in LIFT, ABOVE_PLACE, or DOWN_PLACE states
+        is_carrying = (self.state == S.LIFT) | (self.state == S.ABOVE_PLACE) | (self.state == S.DOWN_PLACE)
+        
+        # We consider the cube lost if it is further than 0.08m from the end-effector
+        # while in carrying states
+        lost = is_carrying & (dist_ee_cube > 0.08)
+        return lost
+
+    def check_phase_timeout(self) -> torch.Tensor:
+        # Timeout if current phase has taken longer than 12.0 seconds
+        # and the robot is not yet DONE (phase < 4)
+        return (self.phase < 4) & (self.phase_timer > 12.0)
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -610,7 +682,10 @@ def main():
     )
 
     # Disable episode length reset within Isaac Sim (we reset manually at 80.0s)
-    env_cfg.episode_length_s = 100.0
+    env_cfg.episode_length_s = 150.0
+    if args_cli.video:
+        env_cfg.viewer.resolution = (args_cli.video_width, args_cli.video_height)
+    video_capture_fps = natural_video_fps(env_cfg)
 
     # Colors in LINEAR color space (converted from sRGB).
     # sRGB → linear: ((x + 0.055) / 1.055) ^ 2.4  (for x > 0.04045)
@@ -641,11 +716,21 @@ def main():
             video_folder=args_cli.video_folder,
             step_trigger=lambda step: step == 0,
             video_length=args_cli.video_length,
+            fps=video_capture_fps,
             disable_logger=True,
         )
         video_dir = os.path.abspath(args_cli.video_folder)
-        print(f"[INFO] Recording video to: {video_dir}", flush=True)
-        print(f"[INFO] Video will finalize after {args_cli.video_length} env steps.", flush=True)
+        print(
+            f"[INFO] Recording video to: {video_dir} "
+            f"({args_cli.video_width}x{args_cli.video_height}, "
+            f"capture {video_capture_fps} fps -> final {args_cli.video_fps} fps)",
+            flush=True,
+        )
+        print(
+            f"[INFO] Video will finalize after {args_cli.video_length} env steps "
+            f"(~{args_cli.video_length / video_capture_fps:.1f}s playback).",
+            flush=True,
+        )
     else:
         env = gym.make(task, cfg=env_cfg)
     print(f"[INFO] Action space: {env.action_space.shape}", flush=True)
@@ -666,7 +751,7 @@ def main():
     while simulation_app.is_running():
         with torch.inference_mode():
             # Check scenario reset
-            if sm.global_time >= 80.0:
+            if sm.global_time >= 120.0:
                 sm.global_time = 0.0
                 env.unwrapped._reset_idx(torch.arange(sm.N, device=sm.dev))
                 sm.reset_idx(torch.arange(sm.N, device=sm.dev))
@@ -700,22 +785,56 @@ def main():
             # Since the table surface is at z = 0.0, any cube z center < 0.01 means it has fallen off the table
             cube_dropped = (c1_pos[:, 2] < 0.01) | (c2_pos[:, 2] < 0.01) | (c3_pos[:, 2] < 0.01)
 
-            # If we are in Stage 1, 2, or 3, we reset if a cube is dropped.
-            # In Stage 4, we do not reset when cubes are dropped.
+            # Detect if robot lost/dropped the cube during carrying (Stage 1 & 2 only)
             if sm.global_time < 60.0:
-                reset_mask = cube_dropped
+                cube_lost = sm.check_cube_lost(ee_pos, c2_pos, c3_pos)
+            else:
+                cube_lost = torch.zeros(sm.N, dtype=torch.bool, device=sm.dev)
+
+            # Detect phase timeout (Stage 1, 2, & 3 only)
+            if sm.global_time < 90.0:
+                phase_timeout = sm.check_phase_timeout()
+            else:
+                phase_timeout = torch.zeros(sm.N, dtype=torch.bool, device=sm.dev)
+
+            # If we are in Stage 1, 2, or 3, we reset if a cube is dropped or a phase times out.
+            # In Stage 4, we do not reset.
+            if sm.global_time < 90.0:
+                reset_mask = cube_dropped | phase_timeout
+                if sm.global_time < 60.0:
+                    reset_mask = reset_mask | cube_lost
             else:
                 reset_mask = torch.zeros(sm.N, dtype=torch.bool, device=sm.dev)
 
             # Also force reset if state machine reaches DONE (roundtrip complete) in Stage 1, 2, or 3
-            if sm.global_time < 60.0:
+            if sm.global_time < 90.0:
                 reset_mask = reset_mask | sm.force_reset_mask()
 
             if reset_mask.any():
                 reset_ids = reset_mask.nonzero(as_tuple=False).squeeze(-1)
+                
+                reasons = []
+                dropped_ids = (reset_mask & cube_dropped).nonzero(as_tuple=False).squeeze(-1)
+                if dropped_ids.numel() > 0:
+                    reasons.append(f"dropped off table: {format_env_ids(dropped_ids)}")
+                
+                lost_ids = (reset_mask & cube_lost).nonzero(as_tuple=False).squeeze(-1)
+                if lost_ids.numel() > 0:
+                    reasons.append(f"lost/failed grasp: {format_env_ids(lost_ids)}")
+                
+                timeout_ids = (reset_mask & phase_timeout).nonzero(as_tuple=False).squeeze(-1)
+                if timeout_ids.numel() > 0:
+                    reasons.append(f"phase timeout: {format_env_ids(timeout_ids)}")
+                
+                done_ids = (reset_mask & sm.force_reset_mask()).nonzero(as_tuple=False).squeeze(-1)
+                if done_ids.numel() > 0:
+                    reasons.append(f"completed cycle: {format_env_ids(done_ids)}")
+                
                 env.unwrapped._reset_idx(reset_ids)
                 sm.reset_idx(reset_ids)
-                print(f"[{step:5d}] manual-reset: {format_env_ids(reset_ids)}", flush=True)
+                
+                reason_str = " | ".join(reasons)
+                print(f"[{step:5d}] manual-reset: {reason_str}", flush=True)
 
             dones = terminated | truncated
             if dones.any():
@@ -728,10 +847,10 @@ def main():
                 sn = [STATE_NAMES[s] for s in sm.state.tolist()]
                 ph = sm.phase.tolist()
                 _, stage_name = scenario_stage(sm.global_time)
-                frozen_envs = (sm.freeze_timer > 0.0).nonzero(as_tuple=False).squeeze(-1).tolist()
+                dropping_envs = (sm.drop_timer > 0.0).nonzero(as_tuple=False).squeeze(-1).tolist()
                 print(
                     f"[{step:5d}] t={sm.global_time:.1f}s | {stage_name} | "
-                    f"states={sn} ph={ph} frozen_envs={frozen_envs}",
+                    f"states={sn} ph={ph} dropping_envs={dropping_envs}",
                     flush=True,
                 )
 
@@ -744,6 +863,8 @@ def main():
                 break
 
     env.close()
+    if args_cli.video:
+        convert_latest_video_fps(args_cli.video_folder, args_cli.video_fps, video_capture_fps)
 
 
 if __name__ == "__main__":
